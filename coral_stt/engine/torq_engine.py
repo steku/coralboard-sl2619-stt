@@ -66,6 +66,15 @@ def _import_vmfb_runner():
     return None
 
 
+def _to_bf16(arr: np.ndarray) -> np.ndarray:
+    """Convert numpy array to bfloat16 using ml_dtypes if available."""
+    try:
+        import ml_dtypes
+        return arr.astype(ml_dtypes.bfloat16)
+    except Exception:
+        return arr
+
+
 class TorqSTTEngine(STTEngine):
     """Speech recognition inference engine running on Coralboard SL2619 Torq NPU."""
 
@@ -184,7 +193,12 @@ class TorqSTTEngine(STTEngine):
 
     def _infer_end_to_end(self, audio_tensor: np.ndarray) -> str:
         """Execute unified model that directly produces token IDs or strings."""
-        outputs = self._encoder_runner.infer([audio_tensor])
+        audio_in = _to_bf16(audio_tensor)
+        try:
+            outputs = self._encoder_runner.infer([audio_in])
+        except Exception:
+            outputs = self._encoder_runner.infer([audio_tensor])
+
         out_arr = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
 
         # If model outputs token sequence
@@ -201,8 +215,14 @@ class TorqSTTEngine(STTEngine):
 
     def _infer_encoder_decoder(self, audio_tensor: np.ndarray) -> str:
         """Execute NPU-accelerated Encoder followed by decoder autoregressive generation."""
-        # Step A: Encoder forward pass on Torq NPU
-        encoder_outputs = self._encoder_runner.infer([audio_tensor])
+        # Step A: Encoder forward pass on Torq NPU (expects bfloat16 input)
+        audio_in = _to_bf16(audio_tensor)
+        try:
+            encoder_outputs = self._encoder_runner.infer([audio_in])
+        except Exception as e:
+            _LOGGER.warning("Encoder inference with bfloat16 failed (%s), retrying with raw input...", e)
+            encoder_outputs = self._encoder_runner.infer([audio_tensor])
+
         audio_features = (
             encoder_outputs[0]
             if isinstance(encoder_outputs, (list, tuple))
@@ -217,21 +237,31 @@ class TorqSTTEngine(STTEngine):
         for _ in range(self._max_tokens):
             tokens_tensor = np.array([tokens], dtype=np.int64)
 
-            # Decoder inference: (tokens, audio_features)
+            # Decoder inference: (tokens/embeddings, audio_features)
             # If token embeddings are loaded, project tokens to embedding vectors
             if self._token_embeddings is not None:
+                token_emb = self._token_embeddings[tokens_tensor]
+                token_emb_bf16 = _to_bf16(token_emb)
                 try:
-                    token_input = self._token_embeddings[tokens_tensor].astype(np.float32)
-                    dec_outputs = self._decoder_runner.infer([token_input, audio_features])
+                    dec_outputs = self._decoder_runner.infer([token_emb_bf16, audio_features])
                 except Exception:
-                    dec_outputs = self._decoder_runner.infer([tokens_tensor, audio_features])
+                    try:
+                        dec_outputs = self._decoder_runner.infer([token_emb.astype(np.float32), audio_features])
+                    except Exception:
+                        dec_outputs = self._decoder_runner.infer([tokens_tensor, audio_features])
             else:
-                dec_outputs = self._decoder_runner.infer([tokens_tensor, audio_features])
+                try:
+                    dec_outputs = self._decoder_runner.infer([tokens_tensor, audio_features])
+                except Exception:
+                    dec_outputs = self._decoder_runner.infer([tokens_tensor.astype(np.int32), audio_features])
 
             logits = dec_outputs[0] if isinstance(dec_outputs, (list, tuple)) else dec_outputs
 
+            # Convert logits to float32 for stable argmax
+            logits_f32 = np.array(logits, dtype=np.float32)
+
             # Greedy next token: logits shape (1, seq_len, vocab_size)
-            next_token = int(np.argmax(logits[0, -1, :]))
+            next_token = int(np.argmax(logits_f32[0, -1, :]))
 
             if next_token == end_tok:
                 break

@@ -39,6 +39,7 @@ def build_wyoming_info(engine: STTEngine) -> Info:
                         ),
                         installed=True,
                         languages=["en"],
+                        version="1.0.0",
                     )
                 ],
             )

@@ -55,7 +55,9 @@ def init_npu_engine(
     # Default model path lookup if not specified
     if model_path is None:
         default_candidates = [
+            "models/encoder.vmfb",
             "models/encode.vmfb",
+            os.path.join(os.path.dirname(__file__), "..", "models", "encoder.vmfb"),
             os.path.join(os.path.dirname(__file__), "..", "models", "encode.vmfb"),
         ]
         for candidate in default_candidates:
@@ -71,15 +73,25 @@ def init_npu_engine(
 
     # Default decoder lookup
     if decoder_path is None:
-        default_decoder = "models/decode.vmfb"
-        if os.path.exists(default_decoder):
-            decoder_path = default_decoder
+        for candidate in [
+            "models/decoder.vmfb",
+            "models/decode.vmfb",
+            os.path.join(os.path.dirname(__file__), "..", "models", "decoder.vmfb"),
+            os.path.join(os.path.dirname(__file__), "..", "models", "decode.vmfb"),
+        ]:
+            if os.path.exists(candidate):
+                decoder_path = candidate
+                break
 
     # Default vocab lookup
     if vocab_path is None:
-        default_vocab = "models/tokenizer.json"
-        if os.path.exists(default_vocab):
-            vocab_path = default_vocab
+        for candidate in [
+            "models/tokenizer.json",
+            os.path.join(os.path.dirname(__file__), "..", "models", "tokenizer.json"),
+        ]:
+            if os.path.exists(candidate):
+                vocab_path = candidate
+                break
 
     _LOGGER.info("Initializing Coralboard SL2619 Torq NPU engine (model: %s)", model_path)
     engine = TorqSTTEngine(

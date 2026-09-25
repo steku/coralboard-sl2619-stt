@@ -5,13 +5,10 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/root/coral-sl2619-stt
-ExecStart=/home/root/coral-sl2619-stt/.venv/bin/python3 -m coral_stt \
+WorkingDirectory=/home/root/coralboard-sl2619-stt
+ExecStart=/home/root/coralboard-sl2619-stt/.venv/bin/python3 -m coral_stt \
     --host 0.0.0.0 \
-    --port 10300 \
-    --model-path /home/root/coral-sl2619-stt/models/encode.vmfb \
-    --decoder-path /home/root/coral-sl2619-stt/models/decode.vmfb \
-    --vocab-path /home/root/coral-sl2619-stt/models/tokenizer.json
+    --port 10300
 Restart=always
 RestartSec=5
 StandardOutput=journal

@@ -42,6 +42,7 @@ class TorqSTTEngine(STTEngine):
         self._encoder_runner = None
         self._decoder_runner = None
         self._tokenizer = None
+        self._token_embeddings = None
         self._is_end_to_end = False
 
     @property
@@ -73,6 +74,21 @@ class TorqSTTEngine(STTEngine):
         if self._decoder_path and os.path.exists(self._decoder_path):
             _LOGGER.info("Loading decoder model on NPU: %s", self._decoder_path)
             self._decoder_runner = VMFBInferenceRunner(self._decoder_path)
+
+            # Check for decoder token embeddings
+            emb_candidates = [
+                os.path.join(os.path.dirname(self._decoder_path), "decoder_token_embeddings.npy"),
+                os.path.join(os.path.dirname(self._model_path), "decoder_token_embeddings.npy"),
+                "models/decoder_token_embeddings.npy",
+            ]
+            for candidate in emb_candidates:
+                if os.path.exists(candidate):
+                    try:
+                        self._token_embeddings = np.load(candidate)
+                        _LOGGER.info("Loaded decoder token embeddings from %s: shape %s", candidate, self._token_embeddings.shape)
+                        break
+                    except Exception as e:
+                        _LOGGER.warning("Failed to load token embeddings from %s: %s", candidate, e)
         else:
             self._is_end_to_end = True
 
@@ -154,7 +170,16 @@ class TorqSTTEngine(STTEngine):
             tokens_tensor = np.array([tokens], dtype=np.int64)
 
             # Decoder inference: (tokens, audio_features)
-            dec_outputs = self._decoder_runner.infer([tokens_tensor, audio_features])
+            # If token embeddings are loaded, project tokens to embedding vectors
+            if self._token_embeddings is not None:
+                try:
+                    token_input = self._token_embeddings[tokens_tensor].astype(np.float32)
+                    dec_outputs = self._decoder_runner.infer([token_input, audio_features])
+                except Exception:
+                    dec_outputs = self._decoder_runner.infer([tokens_tensor, audio_features])
+            else:
+                dec_outputs = self._decoder_runner.infer([tokens_tensor, audio_features])
+
             logits = dec_outputs[0] if isinstance(dec_outputs, (list, tuple)) else dec_outputs
 
             # Greedy next token: logits shape (1, seq_len, vocab_size)

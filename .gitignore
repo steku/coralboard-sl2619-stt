@@ -1,0 +1,34 @@
+# Python & Virtual Environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Models and compiled NPU binaries (downloaded via tools/download_models.py)
+models/
+*.vmfb
+*.npy
+
+# Audio recordings & temporary files
+*.wav
+*.mp3
+*.flac
+*.pcm
+*.tmp
+
+# Secrets and environment configs
+.env
+.env.*
+*.pem
+*.key
+*.cert
+*.token
+
+# System & Editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp

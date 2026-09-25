@@ -74,7 +74,7 @@ Built specifically for **Python 3.12.9** on **Linux aarch64**.
 
 ## USB Networking Setup (Host & Coralboard)
 
-Use [`tools/setup_usb_network.sh`](file:///Users/stephen/Projects/coral-sl2619-wisper/tools/setup_usb_network.sh) to establish a dedicated, safe point-to-point link over USB between your host and the Coralboard without modifying your host's main network or router:
+Use [`tools/setup_usb_network.sh`](tools/setup_usb_network.sh) to establish a dedicated, safe point-to-point link over USB between your host and the Coralboard without modifying your host's main network or router:
 
 ### 1. On Your Linux Host Computer
 Connect the USB-C cable to the board's OTG port, then configure the host USB interface with internet sharing (NAT):

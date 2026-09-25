@@ -173,20 +173,38 @@ class TorqSTTEngine(STTEngine):
         if sample_rate != SAMPLE_RATE:
             audio = resample_linear(audio, sample_rate, SAMPLE_RATE)
 
-        # 3. Format audio tensor: provide normalized audio input
-        audio_input = audio[np.newaxis, :].astype(np.float32)
+        # 3. Format and chunk audio tensor:
+        # Synaptics Torq Moonshine encoder is compiled for fixed 5.0-second (80,000 samples at 16 kHz) windows.
+        CHUNK_SIZE = 80000
+        chunks = []
+        for i in range(0, len(audio), CHUNK_SIZE):
+            chunk = audio[i : i + CHUNK_SIZE]
+            if len(chunk) < CHUNK_SIZE:
+                chunk = np.pad(chunk, (0, CHUNK_SIZE - len(chunk)), mode="constant")
+            chunks.append(chunk)
 
-        # 4. Infer using Torq NPU
-        if self._is_end_to_end:
-            text = self._infer_end_to_end(audio_input)
-        else:
-            text = self._infer_encoder_decoder(audio_input)
+        if not chunks:
+            return ""
+
+        # 4. Infer each chunk using Torq NPU and combine results
+        transcripts = []
+        for chunk in chunks:
+            audio_input = chunk[np.newaxis, :].astype(np.float32)
+            if self._is_end_to_end:
+                chunk_text = self._infer_end_to_end(audio_input)
+            else:
+                chunk_text = self._infer_encoder_decoder(audio_input)
+            if chunk_text:
+                transcripts.append(chunk_text)
+
+        text = " ".join(transcripts).strip()
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         _LOGGER.info(
-            "Transcription completed in %.2f ms (Audio length: %.2f s): '%s'",
+            "Transcription completed in %.2f ms (Audio length: %.2f s, %d chunks): '%s'",
             elapsed_ms,
             len(audio) / SAMPLE_RATE,
+            len(chunks),
             text,
         )
         return text
@@ -194,11 +212,7 @@ class TorqSTTEngine(STTEngine):
     def _infer_end_to_end(self, audio_tensor: np.ndarray) -> str:
         """Execute unified model that directly produces token IDs or strings."""
         audio_in = _to_bf16(audio_tensor)
-        try:
-            outputs = self._encoder_runner.infer([audio_in])
-        except Exception:
-            outputs = self._encoder_runner.infer([audio_tensor])
-
+        outputs = self._encoder_runner.infer([audio_in])
         out_arr = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
 
         # If model outputs token sequence
@@ -215,14 +229,9 @@ class TorqSTTEngine(STTEngine):
 
     def _infer_encoder_decoder(self, audio_tensor: np.ndarray) -> str:
         """Execute NPU-accelerated Encoder followed by decoder autoregressive generation."""
-        # Step A: Encoder forward pass on Torq NPU (expects bfloat16 input)
+        # Step A: Encoder forward pass on Torq NPU (expects bfloat16 input with shape 1x80000)
         audio_in = _to_bf16(audio_tensor)
-        try:
-            encoder_outputs = self._encoder_runner.infer([audio_in])
-        except Exception as e:
-            _LOGGER.warning("Encoder inference with bfloat16 failed (%s), retrying with raw input...", e)
-            encoder_outputs = self._encoder_runner.infer([audio_tensor])
-
+        encoder_outputs = self._encoder_runner.infer([audio_in])
         audio_features = (
             encoder_outputs[0]
             if isinstance(encoder_outputs, (list, tuple))

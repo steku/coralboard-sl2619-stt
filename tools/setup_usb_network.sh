@@ -48,10 +48,21 @@ detect_environment() {
 }
 
 find_linux_usb_interface() {
-    for candidate in $(ip -o link show | awk -F': ' '{print $2}'); do
-        if [[ "$candidate" =~ ^(usb[0-9]+|enx[0-9a-f]+) ]]; then
+    for candidate in $(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1); do
+        # 1. Match typical naming conventions: usb*, enx*, enp*u* (e.g. enp0s20u1u1)
+        if [[ "$candidate" =~ ^(usb[0-9]+|enx[0-9a-fA-F]+|enp[0-9a-zA-Z]+u[0-9a-zA-Z]+) ]]; then
             echo "$candidate"
             return 0
+        fi
+        # 2. Inspect sysfs to check if it's backed by a USB device
+        local syspath="/sys/class/net/$candidate"
+        if [[ -L "$syspath" ]]; then
+            local target
+            target=$(readlink -f "$syspath")
+            if [[ "$target" == *"/usb"* ]]; then
+                echo "$candidate"
+                return 0
+            fi
         fi
     done
     return 1
@@ -78,13 +89,14 @@ restore_host_network() {
     fi
 
     # Restart host network services if available
-    log_info "Restarting host network manager..."
-    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-        systemctl restart NetworkManager
-        log_ok "NetworkManager restarted."
-    elif systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+    if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+        log_info "Restarting systemd-networkd..."
         systemctl restart systemd-networkd
         log_ok "systemd-networkd restarted."
+    elif systemctl is-active --quiet networking 2>/dev/null; then
+        log_info "Restarting networking service..."
+        systemctl restart networking
+        log_ok "networking service restarted."
     fi
 
     log_ok "Host network restoration complete."
@@ -153,6 +165,7 @@ configure_host() {
         log_info "Or specify the interface explicitly: sudo $0 --host <interface_name>"
         exit 1
     fi
+
 
     log_info "Configuring host USB interface $usb_iface with IP $DEFAULT_HOST_IP..."
     ip link set "$usb_iface" up
@@ -224,6 +237,134 @@ configure_host() {
 }
 
 # ------------------------------------------------------------------------------
+# Persistence Setup (Systemd Services & udev Rules)
+# ------------------------------------------------------------------------------
+install_persistence() {
+    require_root
+    local mode="$1"
+    local enable_nat="${2:-false}"
+
+    log_info "Setting up persistence for mode: $mode across reboots and hot-plug..."
+
+    local target_bin="/usr/local/bin/setup_usb_network.sh"
+    mkdir -p /usr/local/bin
+    local script_source
+    script_source="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    cp -f "$script_source" "$target_bin"
+    chmod 755 "$target_bin"
+    log_ok "Installed network script to $target_bin"
+
+    if [[ "$mode" == "board" ]]; then
+        # 1. Coralboard Systemd service
+        local service_file="/etc/systemd/system/coral-usb-network.service"
+        cat <<EOF > "$service_file"
+[Unit]
+Description=Coralboard USB Gadget Network Configuration
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$target_bin --board
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        chmod 644 "$service_file"
+
+        # 2. Configure systemd-networkd if available
+        if [[ -d /etc/systemd/network ]]; then
+            cat <<EOF > /etc/systemd/network/10-coral-usb0.network
+[Match]
+Name=usb0
+
+[Network]
+Address=${DEFAULT_BOARD_IP}/${DEFAULT_PREFIX}
+Gateway=${DEFAULT_HOST_IP}
+DNS=1.1.1.1
+DNS=8.8.8.8
+EOF
+            log_ok "Configured /etc/systemd/network/10-coral-usb0.network"
+        fi
+
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl enable coral-usb-network.service
+            log_ok "Enabled coral-usb-network.service (persists on Coralboard reboot)."
+        fi
+
+    else
+        # Host: Systemd service + udev hotplug rule
+        local nat_arg=""
+        [[ "$enable_nat" == "true" ]] && nat_arg="--nat"
+
+        local service_file="/etc/systemd/system/coral-host-network.service"
+        cat <<EOF > "$service_file"
+[Unit]
+Description=Coralboard USB Host Network & NAT Masquerade
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$target_bin --host $nat_arg
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        chmod 644 "$service_file"
+
+        # udev rule triggers whenever the Coralboard USB ethernet cable connects
+        local udev_file="/etc/udev/rules.d/99-coralboard-network.rules"
+        cat <<EOF > "$udev_file"
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="usb*|enx*|enp*u*", RUN+="$target_bin --host $nat_arg"
+EOF
+        chmod 644 "$udev_file"
+        log_ok "Configured udev hot-plug rule: $udev_file"
+
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules 2>/dev/null || true
+        fi
+
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl enable coral-host-network.service
+            log_ok "Enabled coral-host-network.service (persists on Host boot & USB plug-in)."
+        fi
+    fi
+
+    log_ok "Persistence setup completed successfully!"
+}
+
+remove_persistence() {
+    require_root
+    log_info "Removing persistent network services and rules..."
+
+    if [[ -f /etc/systemd/system/coral-usb-network.service ]]; then
+        systemctl disable --now coral-usb-network.service 2>/dev/null || true
+        rm -f /etc/systemd/system/coral-usb-network.service
+        log_ok "Removed coral-usb-network.service"
+    fi
+    rm -f /etc/systemd/network/10-coral-usb0.network 2>/dev/null || true
+
+    if [[ -f /etc/systemd/system/coral-host-network.service ]]; then
+        systemctl disable --now coral-host-network.service 2>/dev/null || true
+        rm -f /etc/systemd/system/coral-host-network.service
+        log_ok "Removed coral-host-network.service"
+    fi
+    if [[ -f /etc/udev/rules.d/99-coralboard-network.rules ]]; then
+        rm -f /etc/udev/rules.d/99-coralboard-network.rules
+        command -v udevadm >/dev/null 2>&1 && udevadm control --reload-rules 2>/dev/null || true
+        log_ok "Removed 99-coralboard-network.rules"
+    fi
+
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+    log_ok "Persistence removed."
+}
+
+# ------------------------------------------------------------------------------
 # Entrypoint & CLI Parsing
 # ------------------------------------------------------------------------------
 show_help() {
@@ -233,23 +374,31 @@ Usage: sudo $0 [MODE] [OPTIONS]
 Safely configures USB Ethernet networking between a Linux host and Coralboard SL2619.
 
 Modes:
-  --host [USB_IFACE] [--nat]
+  --host [USB_IFACE] [--nat] [--persist]
       Configures host USB port with IP $DEFAULT_HOST_IP.
       Add --nat to share host internet connection without touching host network.
+      Add --persist to persist across host reboots and USB cable hot-plugs.
 
-  --board [IFACE]
+  --board [IFACE] [--persist]
       Configures Coralboard with IP $DEFAULT_BOARD_IP, sets host as default gateway,
       and configures DNS.
+      Add --persist to persist across Coralboard reboots.
+
+  --persist
+      Installs systemd services and udev rules for the detected environment.
+
+  --unpersist
+      Removes installed persistence services and udev rules.
 
   --restore
       Emergency command to tear down any leftover bridge interfaces on host.
 
 Examples:
-  # 1. Share internet from host to Coralboard:
-  sudo $0 --host --nat
+  # 1. Share internet from host to Coralboard and persist across reboots:
+  sudo $0 --host --nat --persist
 
-  # 2. On the Coralboard:
-  sudo $0 --board
+  # 2. On the Coralboard (configure and persist across reboots):
+  sudo $0 --board --persist
 
   # 3. Test internet on the Coralboard:
   curl -I https://huggingface.co
@@ -259,6 +408,7 @@ EOF
 TARGET_MODE=""
 TARGET_IFACE=""
 ENABLE_NAT=false
+PERSIST=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -278,6 +428,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --nat)
             ENABLE_NAT=true
+            shift
+            ;;
+        --persist)
+            PERSIST=true
+            shift
+            ;;
+        --unpersist|--remove-persist)
+            TARGET_MODE="unpersist"
             shift
             ;;
         --restore)
@@ -308,11 +466,21 @@ fi
 case "$TARGET_MODE" in
     host)
         configure_host "$TARGET_IFACE" "$ENABLE_NAT"
+        if [[ "$PERSIST" == "true" ]]; then
+            install_persistence "host" "$ENABLE_NAT"
+        fi
         ;;
     board)
         configure_board "${TARGET_IFACE:-usb0}"
+        if [[ "$PERSIST" == "true" ]]; then
+            install_persistence "board" "$ENABLE_NAT"
+        fi
         ;;
     restore)
         restore_host_network
+        remove_persistence
+        ;;
+    unpersist)
+        remove_persistence
         ;;
 esac

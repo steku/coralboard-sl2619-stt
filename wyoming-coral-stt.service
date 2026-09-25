@@ -1,0 +1,22 @@
+[Unit]
+Description=Wyoming Speech-to-Text Server (Coralboard SL2619 Torq NPU)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/root/coral-sl2619-stt
+ExecStart=/home/root/coral-sl2619-stt/.venv/bin/python3 -m coral_stt \
+    --host 0.0.0.0 \
+    --port 10300 \
+    --model-path /home/root/coral-sl2619-stt/models/encode.vmfb \
+    --decoder-path /home/root/coral-sl2619-stt/models/decode.vmfb \
+    --vocab-path /home/root/coral-sl2619-stt/models/tokenizer.json
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

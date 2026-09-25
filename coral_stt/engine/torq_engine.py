@@ -1,0 +1,170 @@
+"""Synaptics Torq NPU Speech-to-Text Engine for Coralboard SL2619.
+
+Runs speech-to-text models compiled for the Torq NPU (Google Coral Kelvin ML Core)
+via the Torq Runtime Python API.
+"""
+
+import logging
+import os
+import time
+from typing import List, Optional, Tuple
+import numpy as np
+
+from ..audio import log_mel_spectrogram, pcm16_to_float32, resample_linear, SAMPLE_RATE
+from ..tokenizer import STTTokenizer
+from .base import STTEngine
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class TorqSTTEngine(STTEngine):
+    """Speech recognition inference engine running on Coralboard SL2619 Torq NPU."""
+
+    def __init__(
+        self,
+        model_path: str,
+        decoder_path: Optional[str] = None,
+        vocab_path: Optional[str] = None,
+        max_tokens: int = 128,
+    ):
+        """
+        Args:
+            model_path: Path to compiled .vmfb model (encoder or end-to-end model).
+            decoder_path: Optional path to compiled decoder .vmfb (if separated).
+            vocab_path: Path to tokenizer.json file.
+            max_tokens: Maximum tokens to generate per utterance.
+        """
+        self._model_path = model_path
+        self._decoder_path = decoder_path
+        self._vocab_path = vocab_path
+        self._max_tokens = max_tokens
+
+        self._encoder_runner = None
+        self._decoder_runner = None
+        self._tokenizer = None
+        self._is_end_to_end = False
+
+    @property
+    def model_name(self) -> str:
+        base = os.path.basename(self._model_path)
+        return os.path.splitext(base)[0]
+
+    def load(self) -> None:
+        """Load compiled .vmfb artifacts into Torq NPU runtime."""
+        _LOGGER.info("Initializing Coralboard SL2619 Torq NPU runtime...")
+
+        try:
+            from torq_runtime import VMFBInferenceRunner
+        except ImportError as e:
+            _LOGGER.error(
+                "Failed to import `torq_runtime`! "
+                "Ensure the Torq runtime wheel is installed: "
+                "pip install https://github.com/synaptics-torq/torq-compiler/releases/download/v2.1.0/torq_runtime-2.1.0-cp312-cp312-manylinux_2_28_aarch64.whl"
+            )
+            raise e
+
+        if not os.path.exists(self._model_path):
+            raise FileNotFoundError(f"Model VMFB file not found: {self._model_path}")
+
+        _LOGGER.info("Loading primary model on NPU: %s", self._model_path)
+        self._encoder_runner = VMFBInferenceRunner(self._model_path)
+
+        # Inspect if separate decoder VMFB is provided
+        if self._decoder_path and os.path.exists(self._decoder_path):
+            _LOGGER.info("Loading decoder model on NPU: %s", self._decoder_path)
+            self._decoder_runner = VMFBInferenceRunner(self._decoder_path)
+        else:
+            self._is_end_to_end = True
+
+        self._tokenizer = STTTokenizer(self._vocab_path)
+        _LOGGER.info("Torq NPU Engine ready on Coralboard SL2619.")
+
+    def transcribe(
+        self,
+        audio_pcm: bytes,
+        sample_rate: int = SAMPLE_RATE,
+        language: Optional[str] = "en",
+    ) -> str:
+        """Execute NPU inference on raw PCM audio."""
+        if self._encoder_runner is None:
+            raise RuntimeError("TorqSTTEngine is not loaded. Call load() first.")
+
+        start_time = time.perf_counter()
+
+        # 1. Convert PCM to float32
+        audio = pcm16_to_float32(audio_pcm)
+        if len(audio) == 0:
+            return ""
+
+        # 2. Resample to 16 kHz if necessary
+        if sample_rate != SAMPLE_RATE:
+            audio = resample_linear(audio, sample_rate, SAMPLE_RATE)
+
+        # 3. Format audio tensor: provide normalized audio input
+        audio_input = audio[np.newaxis, :].astype(np.float32)
+
+        # 4. Infer using Torq NPU
+        if self._is_end_to_end:
+            text = self._infer_end_to_end(audio_input)
+        else:
+            text = self._infer_encoder_decoder(audio_input)
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        _LOGGER.info(
+            "Transcription completed in %.2f ms (Audio length: %.2f s): '%s'",
+            elapsed_ms,
+            len(audio) / SAMPLE_RATE,
+            text,
+        )
+        return text
+
+    def _infer_end_to_end(self, audio_tensor: np.ndarray) -> str:
+        """Execute unified model that directly produces token IDs or strings."""
+        outputs = self._encoder_runner.infer([audio_tensor])
+        out_arr = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+
+        # If model outputs token sequence
+        if np.issubdtype(out_arr.dtype, np.integer):
+            token_ids = out_arr.flatten().tolist()
+            return self._tokenizer.decode(token_ids).strip()
+
+        # If model outputs character logits (CTC or argmax)
+        if out_arr.ndim == 3:  # (1, T, Vocab)
+            token_ids = np.argmax(out_arr[0], axis=-1).tolist()
+            return self._tokenizer.decode(token_ids).strip()
+
+        return str(out_arr).strip()
+
+    def _infer_encoder_decoder(self, audio_tensor: np.ndarray) -> str:
+        """Execute NPU-accelerated Encoder followed by decoder autoregressive generation."""
+        # Step A: Encoder forward pass on Torq NPU
+        encoder_outputs = self._encoder_runner.infer([audio_tensor])
+        audio_features = (
+            encoder_outputs[0]
+            if isinstance(encoder_outputs, (list, tuple))
+            else encoder_outputs
+        )
+
+        # Step B: Autoregressive decoding
+        start_tok = self._tokenizer.start_token
+        end_tok = self._tokenizer.end_token
+        tokens = [start_tok]
+
+        for _ in range(self._max_tokens):
+            tokens_tensor = np.array([tokens], dtype=np.int64)
+
+            # Decoder inference: (tokens, audio_features)
+            dec_outputs = self._decoder_runner.infer([tokens_tensor, audio_features])
+            logits = dec_outputs[0] if isinstance(dec_outputs, (list, tuple)) else dec_outputs
+
+            # Greedy next token: logits shape (1, seq_len, vocab_size)
+            next_token = int(np.argmax(logits[0, -1, :]))
+
+            if next_token == end_tok:
+                break
+
+            tokens.append(next_token)
+
+        # Decode tokens after the start prefix
+        generated_tokens = tokens[1:]
+        return self._tokenizer.decode(generated_tokens).strip()

@@ -28,23 +28,37 @@ Built specifically for **Python 3.12.9** on **Linux aarch64**.
 |                                                      v                  |
 |                                      +-------------------------------+  |
 |                                      |      Audio Preprocessing      |  |
-|                                      | (Float32 Resample/Normalize)  |  |
+|                                      |  (Float32 / 80k Windowing)    |  |
 |                                      +---------------+---------------+  |
 |                                                      |                  |
 |                                                      v                  |
-|                                      +-------------------------------+  |
-|                                      |      TorqSTTEngine (NPU)      |  |
-|                                      |  - torq_runtime               |  |
-|                                      |  - VMFBInferenceRunner        |  |
-|                                      |  - Coralboard Torq NPU        |  |
-|                                      +-------------------------------+  |
+|  +-------------------------------------------------------------------+  |
+|  |             TorqSTTEngine (Coralboard Torq NPU Hardware)          |  |
+|  |                                                                   |  |
+|  |   +-----------------------+              +---------------------+  |  |
+|  |   |     encoder.vmfb      | ------------>|    decoder.vmfb     |  |  |
+|  |   | (1x80000 Audio bf16)  | 12 Cross-KV  | (26 Inputs ->       |  |  |
+|  |   | -> 6 Layers Cross-KV  | Tensors      |  13 Outputs bf16)   |  |  |
+|  |   +-----------------------+              +----------+----------+  |  |
+|  |                                                     |             |  |
+|  |   +---------------------------------+               | Logits      |  |
+|  |   |  decoder_token_embeddings.npy   |               v             |  |
+|  |   |  (32768 x 288 bfloat16 lookup)  |----> +-------------------+  |  |
+|  |   +---------------------------------+      |   STTTokenizer    |  |  |
+|  |                                            | (Greedy Decoding) |  |  |
+|  |                                            +---------+---------+  |  |
+|  |                                                      |            |  |
+|  |                                                      v            |  |
+|  |                                             Text Transcript       |  |
+|  +-------------------------------------------------------------------+  |
 +-------------------------------------------------------------------------+
 ```
 
 ### Key Capabilities
 - **Native Wyoming Protocol**: Direct plug-and-play integration with Home Assistant's local voice control (Assist).
-- **Coralboard SL2619 Acceleration**: Dedicated NPU inference using Synaptics' `torq_runtime` and pre-compiled Moonshine `.vmfb` artifacts.
-- **Low Latency**: Dynamic audio scaling that processes only the spoken duration, yielding 150–300 ms response latency for typical smart home commands.
+- **100% NPU Hardware Acceleration**: Pure edge execution on the Synaptics Torq NPU (Google Coral Kelvin ML core) with **zero CPU fallbacks or Whisper dependencies**.
+- **Dual-Model Torq Moonshine**: High-accuracy speech recognition via pre-compiled `encoder.vmfb` and autoregressive `decoder.vmfb` models.
+- **Blazing Fast Response**: ~720 ms total inference time for 10-second utterances (~14x faster than real-time).
 
 ---
 

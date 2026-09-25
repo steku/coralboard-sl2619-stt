@@ -62,12 +62,12 @@ Built specifically for **Python 3.12.9** on **Linux aarch64**.
 
 Use [`tools/setup_usb_network.sh`](file:///Users/stephen/Projects/coral-sl2619-wisper/tools/setup_usb_network.sh) to bridge the Coralboard USB adapter to your host's LAN so the board receives an IP address directly from your network router via DHCP:
 
-### 1. On Your Host Computer (macOS or Linux)
+### 1. On Your Linux Host Computer
 Connect the USB-C cable to the board's OTG port, then bridge the network interface:
 ```bash
 sudo bash tools/setup_usb_network.sh --bridge
 ```
-*Creates a network bridge (`bridge0` on macOS / `br0` on Linux) joining your host's network connection and the USB interface. The board is now on the same network as your host and router.*
+*Creates a Linux network bridge (`br0`) joining your host's network connection and the USB interface. The board is now on the same network as your host and router.*
 
 ### 2. On the Coralboard
 Run on the Coralboard (via console or local shell):

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# USB-Ethernet Networking Setup for Synaptics Coralboard SL2619
+# USB-Ethernet Networking Setup for Synaptics Coralboard SL2619 (Linux)
 # Exposes the Coralboard to the same network as the host via bridging,
 # allowing the board to obtain an IP address directly from the LAN's DHCP router.
 # ==============================================================================
@@ -41,26 +41,9 @@ require_root() {
 detect_environment() {
     if [[ -f /etc/os-release ]] && grep -qiE "astra|synaptics|yocto|coral" /etc/os-release 2>/dev/null; then
         echo "board"
-    elif [[ "$(uname -s)" == "Darwin" ]]; then
-        echo "host-mac"
     else
         echo "host-linux"
     fi
-}
-
-find_mac_usb_interface() {
-    local target=""
-    while read -r line; do
-        if echo "$line" | grep -qiE "USB|CDC|NCM|Ethernet|Gadget"; then
-            read -r dev_line
-            target=$(echo "$dev_line" | awk '{print $NF}')
-            if [[ -n "$target" ]]; then
-                echo "$target"
-                return 0
-            fi
-        fi
-    done < <(networksetup -listallhardwareports 2>/dev/null || true)
-    return 1
 }
 
 find_linux_usb_interface() {
@@ -138,39 +121,8 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Host Side: Bridge USB to LAN (Exposing Board to Host Network)
+# Host Side: Bridge USB to LAN (Linux)
 # ------------------------------------------------------------------------------
-configure_bridge_mac() {
-    require_root
-    local uplink="${1:-en0}"
-    local usb_iface="${2:-}"
-
-    if [[ -z "$usb_iface" ]]; then
-        usb_iface=$(find_mac_usb_interface || true)
-    fi
-
-    if [[ -z "$usb_iface" ]]; then
-        log_err "Could not detect USB Ethernet interface. Usage: sudo $0 --bridge <uplink> <usb_iface>"
-        exit 1
-    fi
-
-    log_info "Bridging $uplink and $usb_iface on macOS..."
-
-    # Reset bridge0 if already present
-    ifconfig bridge0 destroy 2>/dev/null || true
-
-    # Create Layer-2 bridge
-    ifconfig bridge0 create
-    ifconfig bridge0 addm "$uplink" addm "$usb_iface"
-    ifconfig "$usb_iface" up
-    ifconfig bridge0 up
-
-    log_ok "Bridge 'bridge0' created joining $uplink and $usb_iface."
-    log_ok "The Coralboard is now exposed directly to your host's local network."
-    log_info "Run on the Coralboard to request an IP from your LAN DHCP router:"
-    log_info "  sudo bash tools/setup_usb_network.sh --board"
-}
-
 configure_bridge_linux() {
     require_root
     local uplink="${1:-}"
@@ -189,7 +141,7 @@ configure_bridge_linux() {
         exit 1
     fi
 
-    log_info "Bridging $uplink and $usb_iface into 'br0' on Linux..."
+    log_info "Bridging uplink ($uplink) and USB ($usb_iface) into 'br0' on Linux..."
 
     ip link add name br0 type bridge 2>/dev/null || true
     ip link set "$usb_iface" master br0
@@ -198,41 +150,29 @@ configure_bridge_linux() {
     ip link set br0 up
 
     log_ok "Linux bridge 'br0' created joining $uplink and $usb_iface."
-    log_ok "The Coralboard is now exposed directly to your host's local network."
+    log_ok "The Coralboard is now exposed directly to your local LAN."
     log_info "Run on the Coralboard to request an IP from your LAN DHCP router:"
     log_info "  sudo bash tools/setup_usb_network.sh --board"
 }
 
 # ------------------------------------------------------------------------------
-# Host Side: Point-to-Point Static IP (No Bridge)
+# Host Side: Point-to-Point Static IP (Linux)
 # ------------------------------------------------------------------------------
 configure_host_static() {
     require_root
     local usb_iface="${1:-}"
 
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        if [[ -z "$usb_iface" ]]; then
-            usb_iface=$(find_mac_usb_interface || true)
-        fi
-        if [[ -z "$usb_iface" ]]; then
-            log_err "No USB interface detected. Usage: sudo $0 --host <interface>"
-            exit 1
-        fi
-        log_info "Assigning static IP $DEFAULT_HOST_IP to $usb_iface..."
-        ifconfig "$usb_iface" "$DEFAULT_HOST_IP" netmask "$DEFAULT_NETMASK" up
-    else
-        if [[ -z "$usb_iface" ]]; then
-            usb_iface=$(find_linux_usb_interface || true)
-        fi
-        if [[ -z "$usb_iface" ]]; then
-            log_err "No USB interface detected. Usage: sudo $0 --host <interface>"
-            exit 1
-        fi
-        log_info "Assigning static IP $DEFAULT_HOST_IP to $usb_iface..."
-        ip link set "$usb_iface" up
-        ip addr flush dev "$usb_iface" 2>/dev/null || true
-        ip addr add "${DEFAULT_HOST_IP}/${DEFAULT_PREFIX}" dev "$usb_iface"
+    if [[ -z "$usb_iface" ]]; then
+        usb_iface=$(find_linux_usb_interface || true)
     fi
+    if [[ -z "$usb_iface" ]]; then
+        log_err "No USB interface detected. Usage: sudo $0 --host <interface>"
+        exit 1
+    fi
+    log_info "Assigning static IP $DEFAULT_HOST_IP to $usb_iface..."
+    ip link set "$usb_iface" up
+    ip addr flush dev "$usb_iface" 2>/dev/null || true
+    ip addr add "${DEFAULT_HOST_IP}/${DEFAULT_PREFIX}" dev "$usb_iface"
 
     log_ok "Host interface $usb_iface configured with IP $DEFAULT_HOST_IP"
 }
@@ -244,14 +184,14 @@ show_help() {
     cat <<EOF
 Usage: sudo $0 [MODE] [OPTIONS]
 
-Configures USB Ethernet networking between a host machine (macOS/Linux)
+Configures USB Ethernet networking between a Linux host machine
 and the Synaptics Coralboard SL2619.
 
 Modes:
   --bridge [UPLINK] [USB_IFACE]
-      Bridges the host's LAN network connection with the Coralboard USB adapter,
-      exposing the Coralboard directly onto your local network so it acquires
-      its IP address from your router's DHCP server.
+      Bridges the Linux host LAN network connection (br0) with the Coralboard
+      USB adapter, exposing the Coralboard directly onto your local network
+      so it acquires its IP address from your router's DHCP server.
 
   --host [USB_IFACE]
       Configures the host USB port with a static IP ($DEFAULT_HOST_IP)
@@ -261,7 +201,7 @@ Modes:
       Run directly on the Coralboard to acquire a DHCP lease from the LAN.
 
 Examples:
-  # 1. On your host machine (bridge USB adapter to LAN):
+  # 1. On your Linux host machine (bridge USB adapter to LAN):
   sudo $0 --bridge
 
   # 2. On the Coralboard (acquire DHCP lease from router):
@@ -322,11 +262,7 @@ fi
 
 case "$TARGET_MODE" in
     bridge)
-        if [[ "$(uname -s)" == "Darwin" ]]; then
-            configure_bridge_mac "$PARAM1" "$PARAM2"
-        else
-            configure_bridge_linux "$PARAM1" "$PARAM2"
-        fi
+        configure_bridge_linux "$PARAM1" "$PARAM2"
         ;;
     host)
         configure_host_static "$PARAM1"

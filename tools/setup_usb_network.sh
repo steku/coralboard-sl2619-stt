@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# USB-Ethernet Networking Setup for Synaptics Coralboard SL2619 (Linux)
-# Exposes the Coralboard to the same network as the host via bridging,
-# allowing the board to obtain an IP address directly from the LAN's DHCP router.
+# Safe USB-Ethernet Networking Setup for Synaptics Coralboard SL2619 (Linux)
+# Configures a dedicated, isolated point-to-point link with optional Internet Sharing (NAT).
+# NEVER touches or modifies your host's primary network adapter or default gateway.
 # ==============================================================================
 
 set -euo pipefail
@@ -11,6 +11,7 @@ DEFAULT_HOST_IP="192.168.100.1"
 DEFAULT_BOARD_IP="192.168.100.2"
 DEFAULT_NETMASK="255.255.255.0"
 DEFAULT_PREFIX="24"
+DEFAULT_SUBNET="192.168.100.0/24"
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -42,7 +43,7 @@ detect_environment() {
     if [[ -f /etc/os-release ]] && grep -qiE "astra|synaptics|yocto|coral" /etc/os-release 2>/dev/null; then
         echo "board"
     else
-        echo "host-linux"
+        echo "host"
     fi
 }
 
@@ -57,124 +58,148 @@ find_linux_usb_interface() {
 }
 
 # ------------------------------------------------------------------------------
+# Emergency Network Restore (Host)
+# ------------------------------------------------------------------------------
+restore_host_network() {
+    require_root
+    log_info "Restoring host network configuration..."
+
+    # Release any interfaces enslaved to br0
+    if ip link show br0 >/dev/null 2>&1; then
+        log_info "Removing interfaces from br0..."
+        for member in $(ip -o link show master br0 2>/dev/null | awk -F': ' '{print $2}'); do
+            log_info "  Detaching $member from br0..."
+            ip link set "$member" nomaster 2>/dev/null || true
+            ip link set "$member" up 2>/dev/null || true
+        done
+        ip link set br0 down 2>/dev/null || true
+        ip link delete br0 type bridge 2>/dev/null || true
+        log_ok "Removed bridge br0."
+    fi
+
+    # Restart host network services if available
+    log_info "Restarting host network manager..."
+    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        systemctl restart NetworkManager
+        log_ok "NetworkManager restarted."
+    elif systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+        systemctl restart systemd-networkd
+        log_ok "systemd-networkd restarted."
+    fi
+
+    log_ok "Host network restoration complete."
+}
+
+# ------------------------------------------------------------------------------
 # Board Side Configuration
 # ------------------------------------------------------------------------------
 configure_board() {
     require_root
     local iface="${1:-usb0}"
 
-    log_info "Bringing up $iface on the Coralboard..."
+    log_info "Configuring Coralboard USB interface ($iface)..."
 
     ip link set "$iface" up 2>/dev/null || ifconfig "$iface" up 2>/dev/null || {
         log_err "Interface $iface not found! Verify USB-C OTG cable is connected."
         exit 1
     }
 
-    log_info "Requesting DHCP lease on $iface from the network..."
-    local dhcp_success=false
+    log_info "Assigning static IP $DEFAULT_BOARD_IP/$DEFAULT_PREFIX to $iface..."
+    ip addr flush dev "$iface" 2>/dev/null || true
+    ip addr add "${DEFAULT_BOARD_IP}/${DEFAULT_PREFIX}" dev "$iface" 2>/dev/null || ifconfig "$iface" "$DEFAULT_BOARD_IP" netmask "$DEFAULT_NETMASK"
+    
+    # Route all outbound traffic to the Host gateway
+    log_info "Setting default gateway to $DEFAULT_HOST_IP..."
+    ip route replace default via "$DEFAULT_HOST_IP" dev "$iface" 2>/dev/null || route add default gw "$DEFAULT_HOST_IP" "$iface" 2>/dev/null || true
 
-    if command -v udhcpc >/dev/null 2>&1; then
-        if udhcpc -i "$iface" -n -q -t 5 -T 2; then
-            dhcp_success=true
-        fi
-    elif command -v dhclient >/dev/null 2>&1; then
-        if dhclient -1 -v "$iface"; then
-            dhcp_success=true
-        fi
-    fi
+    # Configure DNS
+    log_info "Configuring DNS servers (1.1.1.1, 8.8.8.8)..."
+    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
 
-    if [[ "$dhcp_success" == "true" ]]; then
-        local assigned_ip
-        assigned_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1 || ifconfig "$iface" | grep 'inet ' | awk '{print $2}' || true)
-        log_ok "Coralboard acquired DHCP address: $assigned_ip"
+    log_ok "Coralboard $iface configured with IP: $DEFAULT_BOARD_IP (Gateway: $DEFAULT_HOST_IP)"
+    
+    # Test ping to host
+    log_info "Testing connectivity to host ($DEFAULT_HOST_IP)..."
+    if ping -c 2 -W 2 "$DEFAULT_HOST_IP" 2>/dev/null; then
+        log_ok "Host is reachable!"
     else
-        log_warn "No DHCP response received from the network on $iface."
-        log_info "Ensure the host has bridged the USB adapter to the LAN: 'sudo $0 --bridge'"
-        log_info "Falling back to static IP: $DEFAULT_BOARD_IP..."
-
-        ip addr flush dev "$iface" 2>/dev/null || true
-        ip addr add "${DEFAULT_BOARD_IP}/${DEFAULT_PREFIX}" dev "$iface" 2>/dev/null || ifconfig "$iface" "$DEFAULT_BOARD_IP" netmask "$DEFAULT_NETMASK"
-        ip route replace default via "$DEFAULT_HOST_IP" dev "$iface" 2>/dev/null || route add default gw "$DEFAULT_HOST_IP" "$iface" 2>/dev/null || true
-
-        if [[ ! -s /etc/resolv.conf ]] || ! grep -q "nameserver" /etc/resolv.conf; then
-            echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
-        fi
-        log_ok "Configured with static IP: $DEFAULT_BOARD_IP"
+        log_warn "Host not responding. Ensure host side is configured: 'sudo $0 --host'"
     fi
 
-    # Persistent systemd-networkd configuration
-    if [[ -d /etc/systemd/network ]]; then
-        log_info "Saving persistent systemd-network configuration to /etc/systemd/network/10-${iface}.network..."
-        cat <<EOF > "/etc/systemd/network/10-${iface}.network"
-[Match]
-Name=${iface}
-
-[Network]
-DHCP=yes
-
-[DHCPv4]
-UseDNS=yes
-UseRoutes=yes
-EOF
-        systemctl restart systemd-networkd 2>/dev/null || true
+    # Test internet access
+    log_info "Testing internet connectivity..."
+    if ping -c 2 -W 2 1.1.1.1 2>/dev/null; then
+        log_ok "Internet connectivity verified on the Coralboard!"
+    else
+        log_warn "No internet access yet. Enable NAT on your host: 'sudo $0 --host --nat'"
     fi
 }
 
 # ------------------------------------------------------------------------------
-# Host Side: Bridge USB to LAN (Linux)
+# Host Side Configuration (Isolated Point-to-Point + Optional NAT)
 # ------------------------------------------------------------------------------
-configure_bridge_linux() {
-    require_root
-    local uplink="${1:-}"
-    local usb_iface="${2:-}"
-
-    if [[ -z "$uplink" ]]; then
-        uplink=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1 || true)
-    fi
-
-    if [[ -z "$usb_iface" ]]; then
-        usb_iface=$(find_linux_usb_interface || true)
-    fi
-
-    if [[ -z "$uplink" || -z "$usb_iface" ]]; then
-        log_err "Could not identify network interfaces. Usage: sudo $0 --bridge <uplink> <usb_iface>"
-        exit 1
-    fi
-
-    log_info "Bridging uplink ($uplink) and USB ($usb_iface) into 'br0' on Linux..."
-
-    ip link add name br0 type bridge 2>/dev/null || true
-    ip link set "$usb_iface" master br0
-    ip link set "$uplink" master br0
-    ip link set "$usb_iface" up
-    ip link set br0 up
-
-    log_ok "Linux bridge 'br0' created joining $uplink and $usb_iface."
-    log_ok "The Coralboard is now exposed directly to your local LAN."
-    log_info "Run on the Coralboard to request an IP from your LAN DHCP router:"
-    log_info "  sudo bash tools/setup_usb_network.sh --board"
-}
-
-# ------------------------------------------------------------------------------
-# Host Side: Point-to-Point Static IP (Linux)
-# ------------------------------------------------------------------------------
-configure_host_static() {
+configure_host() {
     require_root
     local usb_iface="${1:-}"
+    local enable_nat="${2:-false}"
 
     if [[ -z "$usb_iface" ]]; then
         usb_iface=$(find_linux_usb_interface || true)
     fi
+
     if [[ -z "$usb_iface" ]]; then
-        log_err "No USB interface detected. Usage: sudo $0 --host <interface>"
+        log_err "No Coralboard USB Ethernet interface detected (usbX / enxX)."
+        log_info "Verify the USB-C cable is connected to the Coralboard's OTG port."
+        log_info "Or specify the interface explicitly: sudo $0 --host <interface_name>"
         exit 1
     fi
-    log_info "Assigning static IP $DEFAULT_HOST_IP to $usb_iface..."
+
+    log_info "Configuring host USB interface $usb_iface with IP $DEFAULT_HOST_IP..."
     ip link set "$usb_iface" up
     ip addr flush dev "$usb_iface" 2>/dev/null || true
     ip addr add "${DEFAULT_HOST_IP}/${DEFAULT_PREFIX}" dev "$usb_iface"
 
-    log_ok "Host interface $usb_iface configured with IP $DEFAULT_HOST_IP"
+    log_ok "Host USB interface $usb_iface configured with IP $DEFAULT_HOST_IP"
+    log_ok "Your host's primary LAN/Wi-Fi connection remains completely untouched."
+
+    # Optional: Enable NAT Internet Sharing
+    if [[ "$enable_nat" == "true" ]]; then
+        local uplink
+        uplink=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1 || true)
+
+        if [[ -z "$uplink" ]]; then
+            log_warn "Could not detect active internet uplink interface on host for NAT."
+        else
+            log_info "Enabling IP forwarding and NAT masquerade from $usb_iface -> $uplink..."
+            sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+
+            if command -v iptables >/dev/null 2>&1; then
+                # NAT Masquerade
+                iptables -t nat -C POSTROUTING -s "$DEFAULT_SUBNET" -o "$uplink" -j MASQUERADE 2>/dev/null || \
+                iptables -t nat -A POSTROUTING -s "$DEFAULT_SUBNET" -o "$uplink" -j MASQUERADE 2>/dev/null || true
+
+                # Forwarding rules
+                iptables -C FORWARD -i "$usb_iface" -o "$uplink" -j ACCEPT 2>/dev/null || \
+                iptables -A FORWARD -i "$usb_iface" -o "$uplink" -j ACCEPT 2>/dev/null || true
+
+                iptables -C FORWARD -i "$uplink" -o "$usb_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+                iptables -A FORWARD -i "$uplink" -o "$usb_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+                log_ok "NAT enabled! Internet from $uplink is now shared to the Coralboard."
+            else
+                log_warn "iptables not found; install iptables to enable automatic NAT."
+            fi
+        fi
+    fi
+
+    log_info "Pinging Coralboard at $DEFAULT_BOARD_IP..."
+    if ping -c 2 -W 2 "$DEFAULT_BOARD_IP" 2>/dev/null; then
+        log_ok "Coralboard ($DEFAULT_BOARD_IP) is responding!"
+        log_ok "Connect via SSH: ssh root@$DEFAULT_BOARD_IP"
+    else
+        log_warn "Coralboard ($DEFAULT_BOARD_IP) not responding yet."
+        log_info "Run on the Coralboard: sudo bash tools/setup_usb_network.sh --board"
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -184,60 +209,59 @@ show_help() {
     cat <<EOF
 Usage: sudo $0 [MODE] [OPTIONS]
 
-Configures USB Ethernet networking between a Linux host machine
-and the Synaptics Coralboard SL2619.
+Safely configures USB Ethernet networking between a Linux host and Coralboard SL2619.
 
 Modes:
-  --bridge [UPLINK] [USB_IFACE]
-      Bridges the Linux host LAN network connection (br0) with the Coralboard
-      USB adapter, exposing the Coralboard directly onto your local network
-      so it acquires its IP address from your router's DHCP server.
-
-  --host [USB_IFACE]
-      Configures the host USB port with a static IP ($DEFAULT_HOST_IP)
-      for direct point-to-point connections.
+  --host [USB_IFACE] [--nat]
+      Configures host USB port with IP $DEFAULT_HOST_IP.
+      Add --nat to share host internet connection without touching host network.
 
   --board [IFACE]
-      Run directly on the Coralboard to acquire a DHCP lease from the LAN.
+      Configures Coralboard with IP $DEFAULT_BOARD_IP, sets host as default gateway,
+      and configures DNS.
+
+  --restore
+      Emergency command to tear down any leftover bridge interfaces on host.
 
 Examples:
-  # 1. On your Linux host machine (bridge USB adapter to LAN):
-  sudo $0 --bridge
+  # 1. Share internet from host to Coralboard:
+  sudo $0 --host --nat
 
-  # 2. On the Coralboard (acquire DHCP lease from router):
+  # 2. On the Coralboard:
   sudo $0 --board
+
+  # 3. Test internet on the Coralboard:
+  curl -I https://huggingface.co
 EOF
 }
 
 TARGET_MODE=""
-PARAM1=""
-PARAM2=""
+TARGET_IFACE=""
+ENABLE_NAT=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --bridge)
-            TARGET_MODE="bridge"
-            shift
-            if [[ -n "${1:-}" && ! "$1" =~ ^-- ]]; then
-                PARAM1="$1"; shift
-            fi
-            if [[ -n "${1:-}" && ! "$1" =~ ^-- ]]; then
-                PARAM2="$1"; shift
-            fi
-            ;;
         --host)
             TARGET_MODE="host"
             shift
             if [[ -n "${1:-}" && ! "$1" =~ ^-- ]]; then
-                PARAM1="$1"; shift
+                TARGET_IFACE="$1"; shift
             fi
             ;;
         --board)
             TARGET_MODE="board"
             shift
             if [[ -n "${1:-}" && ! "$1" =~ ^-- ]]; then
-                PARAM1="$1"; shift
+                TARGET_IFACE="$1"; shift
             fi
+            ;;
+        --nat)
+            ENABLE_NAT=true
+            shift
+            ;;
+        --restore)
+            TARGET_MODE="restore"
+            shift
             ;;
         -h|--help)
             show_help
@@ -256,18 +280,18 @@ if [[ -z "$TARGET_MODE" ]]; then
     if [[ "$ENV_TYPE" == "board" ]]; then
         TARGET_MODE="board"
     else
-        TARGET_MODE="bridge"
+        TARGET_MODE="host"
     fi
 fi
 
 case "$TARGET_MODE" in
-    bridge)
-        configure_bridge_linux "$PARAM1" "$PARAM2"
-        ;;
     host)
-        configure_host_static "$PARAM1"
+        configure_host "$TARGET_IFACE" "$ENABLE_NAT"
         ;;
     board)
-        configure_board "${PARAM1:-usb0}"
+        configure_board "${TARGET_IFACE:-usb0}"
+        ;;
+    restore)
+        restore_host_network
         ;;
 esac

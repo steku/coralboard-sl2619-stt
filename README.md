@@ -60,21 +60,28 @@ Built specifically for **Python 3.12.9** on **Linux aarch64**.
 
 ## USB Networking Setup (Host & Coralboard)
 
-Use [`tools/setup_usb_network.sh`](file:///Users/stephen/Projects/coral-sl2619-wisper/tools/setup_usb_network.sh) to bridge the Coralboard USB adapter to your host's LAN so the board receives an IP address directly from your network router via DHCP:
+Use [`tools/setup_usb_network.sh`](file:///Users/stephen/Projects/coral-sl2619-wisper/tools/setup_usb_network.sh) to establish a dedicated, safe point-to-point link over USB between your host and the Coralboard without modifying your host's main network or router:
 
 ### 1. On Your Linux Host Computer
-Connect the USB-C cable to the board's OTG port, then bridge the network interface:
+Connect the USB-C cable to the board's OTG port, then configure the host USB interface with internet sharing (NAT):
 ```bash
-sudo bash tools/setup_usb_network.sh --bridge
+sudo bash tools/setup_usb_network.sh --host --nat
 ```
-*Creates a Linux network bridge (`br0`) joining your host's network connection and the USB interface. The board is now on the same network as your host and router.*
+*Assigns static IP `192.168.100.1` to the USB interface and shares host internet via NAT. Your primary LAN/Wi-Fi connection remains completely untouched.*
+
+*(Note: If a previous bridge broke your host network, run `sudo bash tools/setup_usb_network.sh --restore` to immediately tear it down and restore your connection).*
 
 ### 2. On the Coralboard
 Run on the Coralboard (via console or local shell):
 ```bash
 sudo bash tools/setup_usb_network.sh --board
 ```
-*Requests an IP address via DHCP directly from your local router on `usb0` and sets up persistent networking.*
+*Assigns static IP `192.168.100.2` to `usb0`, sets the default gateway to `192.168.100.1`, and configures DNS so the Coralboard has full outbound internet access.*
+
+Once configured, connect from your host:
+```bash
+ssh root@192.168.100.2
+```
 
 ---
 

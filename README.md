@@ -97,7 +97,7 @@ scp -r coral-sl2619-stt root@<CORALBOARD_IP>:/home/root/
 SSH into the Coralboard and execute the automated setup script:
 ```bash
 ssh root@<CORALBOARD_IP>
-cd /home/root/coral-sl2619-stt
+cd /home/root/coralboard-sl2619-stt
 chmod +x install.sh
 ./install.sh
 ```
@@ -105,9 +105,8 @@ chmod +x install.sh
 The script will:
 1. Verify Python 3.12 runtime.
 2. Initialize a virtual environment at `.venv` with access to system site packages.
-3. Install dependencies from `requirements.txt`.
-4. Install the official Synaptics Torq Runtime wheel for Python 3.12 (`cp312-manylinux_2_28_aarch64`).
-5. Download the Moonshine tokenizer and pre-compiled Torq NPU `.vmfb` models into `models/`.
+3. Install dependencies from `requirements.txt` (including the Torq runtime wheel).
+4. Download the Moonshine tokenizer and pre-compiled Torq NPU `.vmfb` models into `models/`.
 
 ### 3. Downloading Models Manually (Optional)
 You can also re-run model downloads anytime using:
@@ -129,8 +128,8 @@ source .venv/bin/activate
 python3 -m coral_stt \
     --host 0.0.0.0 \
     --port 10300 \
-    --model-path models/encode.vmfb \
-    --decoder-path models/decode.vmfb \
+    --model-path models/encoder.vmfb \
+    --decoder-path models/decoder.vmfb \
     --vocab-path models/tokenizer.json \
     --debug
 ```

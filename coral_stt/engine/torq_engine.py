@@ -17,6 +17,55 @@ from .base import STTEngine
 _LOGGER = logging.getLogger(__name__)
 
 
+def _import_vmfb_runner():
+    """Import VMFBInferenceRunner supporting both torq.runtime and legacy paths."""
+    # 1. Official Synaptics torq.runtime package
+    try:
+        from torq.runtime import VMFBInferenceRunner
+        return VMFBInferenceRunner
+    except ImportError:
+        pass
+
+    # 2. Legacy torq_runtime package
+    try:
+        from torq_runtime import VMFBInferenceRunner
+        return VMFBInferenceRunner
+    except ImportError:
+        pass
+
+    # 3. Check system site-packages if running inside a virtualenv
+    import sys
+    system_candidates = [
+        "/usr/lib/python3.12/site-packages",
+        "/usr/local/lib/python3.12/site-packages",
+        "/usr/lib/python3/dist-packages",
+    ]
+    for candidate_dir in system_candidates:
+        if os.path.exists(candidate_dir) and candidate_dir not in sys.path:
+            sys.path.append(candidate_dir)
+
+    try:
+        from torq.runtime import VMFBInferenceRunner
+        return VMFBInferenceRunner
+    except ImportError:
+        pass
+
+    try:
+        from torq_runtime import VMFBInferenceRunner
+        return VMFBInferenceRunner
+    except ImportError:
+        pass
+
+    # 4. Underlying iree.runtime fallback
+    try:
+        from iree.runtime import VMFBInferenceRunner
+        return VMFBInferenceRunner
+    except ImportError:
+        pass
+
+    return None
+
+
 class TorqSTTEngine(STTEngine):
     """Speech recognition inference engine running on Coralboard SL2619 Torq NPU."""
 
@@ -54,15 +103,14 @@ class TorqSTTEngine(STTEngine):
         """Load compiled .vmfb artifacts into Torq NPU runtime."""
         _LOGGER.info("Initializing Coralboard SL2619 Torq NPU runtime...")
 
-        try:
-            from torq_runtime import VMFBInferenceRunner
-        except ImportError as e:
+        VMFBInferenceRunner = _import_vmfb_runner()
+        if VMFBInferenceRunner is None:
             _LOGGER.error(
-                "Failed to import `torq_runtime`! "
-                "Ensure the Torq runtime wheel is installed: "
+                "Failed to import Torq runtime (`torq.runtime`)! "
+                "Ensure torq-runtime is installed: "
                 "pip install https://github.com/synaptics-torq/torq-compiler/releases/download/v2.1.0/torq_runtime-2.1.0-cp312-cp312-manylinux_2_28_aarch64.whl"
             )
-            raise e
+            raise ImportError("Could not find `torq.runtime` or `torq_runtime`.")
 
         if not os.path.exists(self._model_path):
             raise FileNotFoundError(f"Model VMFB file not found: {self._model_path}")

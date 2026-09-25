@@ -162,33 +162,54 @@ configure_host() {
     log_ok "Host USB interface $usb_iface configured with IP $DEFAULT_HOST_IP"
     log_ok "Your host's primary LAN/Wi-Fi connection remains completely untouched."
 
-    # Optional: Enable NAT Internet Sharing
+    # Optional: Enable NAT Internet Sharing & Forwarding Rules
     if [[ "$enable_nat" == "true" ]]; then
         local uplink
         uplink=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1 || true)
 
-        if [[ -z "$uplink" ]]; then
-            log_warn "Could not detect active internet uplink interface on host for NAT."
-        else
-            log_info "Enabling IP forwarding and NAT masquerade from $usb_iface -> $uplink..."
-            sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+        log_info "Enabling IPv4 forwarding..."
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
 
-            if command -v iptables >/dev/null 2>&1; then
-                # NAT Masquerade
-                iptables -t nat -C POSTROUTING -s "$DEFAULT_SUBNET" -o "$uplink" -j MASQUERADE 2>/dev/null || \
-                iptables -t nat -A POSTROUTING -s "$DEFAULT_SUBNET" -o "$uplink" -j MASQUERADE 2>/dev/null || true
+        if command -v iptables >/dev/null 2>&1; then
+            log_info "Applying iptables rules to allow traffic from $usb_iface to the internet..."
 
-                # Forwarding rules
+            # 1. Allow input from USB interface to host services (DNS, ICMP ping)
+            iptables -C INPUT -i "$usb_iface" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT 1 -i "$usb_iface" -j ACCEPT 2>/dev/null || true
+
+            # 2. Forwarding: Allow traffic originating from USB interface out to the internet
+            iptables -C FORWARD -i "$usb_iface" ! -o "$usb_iface" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -i "$usb_iface" ! -o "$usb_iface" -j ACCEPT 2>/dev/null || true
+
+            if [[ -n "$uplink" ]]; then
                 iptables -C FORWARD -i "$usb_iface" -o "$uplink" -j ACCEPT 2>/dev/null || \
-                iptables -A FORWARD -i "$usb_iface" -o "$uplink" -j ACCEPT 2>/dev/null || true
-
-                iptables -C FORWARD -i "$uplink" -o "$usb_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-                iptables -A FORWARD -i "$uplink" -o "$usb_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-
-                log_ok "NAT enabled! Internet from $uplink is now shared to the Coralboard."
-            else
-                log_warn "iptables not found; install iptables to enable automatic NAT."
+                iptables -I FORWARD 1 -i "$usb_iface" -o "$uplink" -j ACCEPT 2>/dev/null || true
             fi
+
+            # 3. Forwarding: Allow established/related return traffic back to the Coralboard
+            iptables -C FORWARD -o "$usb_iface" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -o "$usb_iface" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -o "$usb_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+            # 4. NAT Masquerade: Rewrite source IP for outbound packets from the Coralboard subnet
+            iptables -t nat -C POSTROUTING -s "$DEFAULT_SUBNET" ! -o "$usb_iface" -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -I POSTROUTING 1 -s "$DEFAULT_SUBNET" ! -o "$usb_iface" -j MASQUERADE 2>/dev/null || true
+
+            if [[ -n "$uplink" ]]; then
+                iptables -t nat -C POSTROUTING -s "$DEFAULT_SUBNET" -o "$uplink" -j MASQUERADE 2>/dev/null || \
+                iptables -t nat -I POSTROUTING 1 -s "$DEFAULT_SUBNET" -o "$uplink" -j MASQUERADE 2>/dev/null || true
+            fi
+
+            # 5. Firewalld integration (if active on Fedora/RHEL/CentOS)
+            if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+                log_info "firewalld is active; trusting $usb_iface and enabling masquerade..."
+                firewall-cmd --zone=trusted --add-interface="$usb_iface" 2>/dev/null || true
+                firewall-cmd --add-masquerade 2>/dev/null || true
+            fi
+
+            log_ok "iptables rules applied: Internet traffic from $usb_iface is now allowed and masqueraded."
+        else
+            log_warn "iptables not found; please install iptables to enable automatic NAT."
         fi
     fi
 

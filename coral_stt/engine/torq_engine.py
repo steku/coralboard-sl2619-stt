@@ -66,13 +66,24 @@ def _import_vmfb_runner():
     return None
 
 
-def _to_bf16(arr: np.ndarray) -> np.ndarray:
-    """Convert numpy array to bfloat16 using ml_dtypes if available."""
+def _get_bf16_dtype():
+    """Get bfloat16 dtype from ml_dtypes if available."""
     try:
         import ml_dtypes
-        return arr.astype(ml_dtypes.bfloat16)
+        return ml_dtypes.bfloat16
     except Exception:
+        return np.float32
+
+
+def _to_bf16(arr: np.ndarray) -> np.ndarray:
+    """Convert numpy array to bfloat16 using ml_dtypes if available."""
+    bf16_dt = _get_bf16_dtype()
+    if arr.dtype == bf16_dt:
         return arr
+    if arr.dtype.kind == "V" and arr.dtype.itemsize == 2:
+        return arr.view(bf16_dt)
+    return arr.astype(bf16_dt)
+
 
 
 class TorqSTTEngine(STTEngine):
@@ -141,8 +152,14 @@ class TorqSTTEngine(STTEngine):
             for candidate in emb_candidates:
                 if os.path.exists(candidate):
                     try:
-                        self._token_embeddings = np.load(candidate)
-                        _LOGGER.info("Loaded decoder token embeddings from %s: shape %s", candidate, self._token_embeddings.shape)
+                        raw = np.load(candidate)
+                        self._token_embeddings = _to_bf16(raw)
+                        _LOGGER.info(
+                            "Loaded decoder token embeddings from %s: shape %s, dtype %s",
+                            candidate,
+                            self._token_embeddings.shape,
+                            self._token_embeddings.dtype,
+                        )
                         break
                     except Exception as e:
                         _LOGGER.warning("Failed to load token embeddings from %s: %s", candidate, e)
@@ -228,55 +245,72 @@ class TorqSTTEngine(STTEngine):
         return str(out_arr).strip()
 
     def _infer_encoder_decoder(self, audio_tensor: np.ndarray) -> str:
-        """Execute NPU-accelerated Encoder followed by decoder autoregressive generation."""
+        """Execute NPU-accelerated Encoder followed by decoder autoregressive generation.
+        
+        Exact ABI for Moonshine tiny on Torq NPU:
+        - Encoder: input [1, 80000] (bf16) -> 12 outputs (6 layers of cross-attention key/val pairs)
+        - Decoder: 26 inputs -> 13 outputs (logits + 12 updated past self-attention KV caches)
+        """
+        bf16_dt = _get_bf16_dtype()
+
         # Step A: Encoder forward pass on Torq NPU (expects bfloat16 input with shape 1x80000)
         audio_in = _to_bf16(audio_tensor)
         encoder_outputs = self._encoder_runner.infer([audio_in])
-        audio_features = (
-            encoder_outputs[0]
-            if isinstance(encoder_outputs, (list, tuple))
-            else encoder_outputs
-        )
+        if not isinstance(encoder_outputs, (list, tuple)) or len(encoder_outputs) < 12:
+            _LOGGER.error("Expected 12 encoder outputs for 6 decoder layers, got %s", type(encoder_outputs))
+            return ""
 
         # Step B: Autoregressive decoding
         start_tok = self._tokenizer.start_token
         end_tok = self._tokenizer.end_token
-        tokens = [start_tok]
+        current_token = start_tok
+        generated_tokens: List[int] = []
 
-        for _ in range(self._max_tokens):
-            tokens_tensor = np.array([tokens], dtype=np.int64)
+        # Decoder self-attention cache has fixed sequence length dimension 30
+        max_steps = min(self._max_tokens, 30)
 
-            # Decoder inference: (tokens/embeddings, audio_features)
-            # If token embeddings are loaded, project tokens to embedding vectors
+        # Initialize 12 self-attention past KV caches (2 per layer x 6 layers)
+        # Each has shape (1, 8, 30, 36) and dtype bfloat16
+        past_kvs = [np.zeros((1, 8, 30, 36), dtype=bf16_dt) for _ in range(12)]
+
+        for step in range(max_steps):
+            # 1. Token embedding for current_token: shape (1, 1, 288), bfloat16
             if self._token_embeddings is not None:
-                token_emb = self._token_embeddings[tokens_tensor]
-                token_emb_bf16 = _to_bf16(token_emb)
-                try:
-                    dec_outputs = self._decoder_runner.infer([token_emb_bf16, audio_features])
-                except Exception:
-                    try:
-                        dec_outputs = self._decoder_runner.infer([token_emb.astype(np.float32), audio_features])
-                    except Exception:
-                        dec_outputs = self._decoder_runner.infer([tokens_tensor, audio_features])
+                token_vec = self._token_embeddings[current_token : current_token + 1]
+                token_emb = np.expand_dims(token_vec, axis=0)  # shape (1, 1, 288)
+                if token_emb.dtype != bf16_dt:
+                    token_emb = _to_bf16(token_emb)
             else:
-                try:
-                    dec_outputs = self._decoder_runner.infer([tokens_tensor, audio_features])
-                except Exception:
-                    dec_outputs = self._decoder_runner.infer([tokens_tensor.astype(np.int32), audio_features])
+                token_emb = np.zeros((1, 1, 288), dtype=bf16_dt)
 
-            logits = dec_outputs[0] if isinstance(dec_outputs, (list, tuple)) else dec_outputs
+            # 2. Position step tensor: shape (1, 1), int32
+            pos_tensor = np.array([[step]], dtype=np.int32)
 
-            # Convert logits to float32 for stable argmax
+            # 3. Assemble 26 inputs:
+            # [token_emb, pos_tensor] + 6 layers * (past_k, past_v, cross_k, cross_v)
+            decoder_args = [token_emb, pos_tensor]
+            for l in range(6):
+                decoder_args.append(past_kvs[2 * l])
+                decoder_args.append(past_kvs[2 * l + 1])
+                decoder_args.append(encoder_outputs[2 * l])
+                decoder_args.append(encoder_outputs[2 * l + 1])
+
+            # 4. Decoder forward pass
+            dec_outputs = self._decoder_runner.infer(decoder_args)
+
+            # Output 0: next-token logits of shape (1, 1, 32768)
+            # Outputs 1..12: 12 updated past self-attention KV caches of shape (1, 8, 30, 36)
+            logits = dec_outputs[0]
+            past_kvs = list(dec_outputs[1:13])
+
+            # Greedy next-token argmax
             logits_f32 = np.array(logits, dtype=np.float32)
-
-            # Greedy next token: logits shape (1, seq_len, vocab_size)
-            next_token = int(np.argmax(logits_f32[0, -1, :]))
+            next_token = int(np.argmax(logits_f32[0, 0, :]))
 
             if next_token == end_tok:
                 break
 
-            tokens.append(next_token)
+            generated_tokens.append(next_token)
+            current_token = next_token
 
-        # Decode tokens after the start prefix
-        generated_tokens = tokens[1:]
         return self._tokenizer.decode(generated_tokens).strip()
